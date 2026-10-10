@@ -44,13 +44,32 @@ export function createApp({ db, reportsDir = "reports", render = renderPdf }) {
     }
   }
 
+  // Once-per-day rule: one report per (UTC day, options). Two layers, because a double-click sends the
+  // second request while the first is still rendering, before any row exists to find:
+  //  1. a finished report for today -> return it (200)
+  //  2. one still being generated   -> wait for that same job and return its result (200)
+  const today = () => new Date().toISOString().slice(0, 10);
+  const inFlight = new Map(); // key -> Promise<row>
+
   app.post("/reports", async (req, res) => {
     const days = req.body?.days;
     if (days !== undefined && !(Number.isInteger(days) && days >= 1 && days <= 365)) {
       return res.status(400).json({ error: "days must be an integer from 1 to 365" });
     }
+    const params = days ? { days } : {};
+    const force = req.body?.force === true; // { "force": true } skips the check and always makes a new file
     try {
-      const row = await generate(days ? { days } : {});
+      if (!force) {
+        const key = `${today()}|${JSON.stringify(params)}`;
+        const existing = db.prepare("SELECT * FROM reports WHERE day = ? AND params = ? ORDER BY id DESC LIMIT 1").get(today(), JSON.stringify(params));
+        if (existing) return res.status(200).json(view(existing));
+        const running = inFlight.get(key);
+        if (running) return res.status(200).json(view(await running));
+        const job = generate(params).finally(() => inFlight.delete(key));
+        inFlight.set(key, job);
+        return res.status(201).json(view(await job));
+      }
+      const row = await generate(params);
       res.status(201).json(view(row));
     } catch (e) {
       console.error("report generation failed:", e);
